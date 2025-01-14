@@ -1,5 +1,5 @@
-from functools import lru_cache, cached_property, partial
-from typing import Optional, Tuple, cast
+from functools import cached_property, partial
+from typing import Optional, Tuple
 
 import torch
 
@@ -11,7 +11,7 @@ from rl4co.models.common.constructive.nonautoregressive.decoder import (
     NonAutoregressiveDecoder,
 )
 from rl4co.utils.decoding import Sampling
-from rl4co.utils.ops import batchify, get_distance_matrix, unbatchify
+from rl4co.utils.ops import get_distance_matrix, unbatchify
 
 
 class GA:
@@ -156,7 +156,6 @@ class GA:
         # reshape from (batch_size * n_offspring, ...) to (batch_size, n_offspring, ...)
         reward = unbatchify(reward, self.n_offspring)
         actions = unbatchify(actions, self.n_offspring)
-
         # update final actions and rewards
         self._update_results(actions, reward)
         # update population
@@ -165,7 +164,6 @@ class GA:
         return actions, reward, population  # type: ignore
 
     def _sampling(self, td: TensorDict, env: RL4COEnvBase, parents_mask: Optional[Tensor] = None):
-        # Sample from heatmaps
         batch_indices = torch.arange(
             parents_mask.size(0), device=parents_mask.device
         ) if parents_mask is not None else None
@@ -184,7 +182,12 @@ class GA:
 
             # NGO masking
             if parents_mask is not None:
-                new_mask = mask * parents_mask[batch_indices, td["action"]]
+                # # Dense Version
+                # new_mask = mask * parents_mask[batch_indices, td["action"]]
+
+                # Sparse Version (to avoid OOM)
+                new_mask = mask * parents_mask.to_dense()[batch_indices, td["action"]]
+
                 # Mutation here
                 invalid_indices = new_mask.sum(-1) == 0  # invalid case
                 mutation_indices = torch.rand(  # stochastic mutation
@@ -295,7 +298,6 @@ class GA:
         self, env_name, actions, reward, population: dict[str, Tensor]
     ) -> dict[str, Tensor]:
         assert actions.size(1) == self.n_offspring
-
         if env_name == "tsp":
             concated_actions = torch.cat([population["actions"], actions], dim=1)
             # concated_actions.shape == (batch_size, n_population + n_offspring, seq_len)
@@ -338,27 +340,30 @@ class GA:
         # actions_flat.shape == (batch_size * n, seq_len)
 
         if env_name == "tsp":
-            edge_mask = torch.zeros(
-                actions_flat.size(0), seq_len, seq_len, dtype=torch.bool, device=actions.device
-            )
-            edge_index = torch.stack(
-                [actions_flat, torch.roll(actions_flat, shifts=-1, dims=1)], dim=2
-            )
-            # edge_index.shape == (batch_size * n, seq_len, 2)
-            flat_batch_indices = torch.arange(
-                actions_flat.size(0), device=actions.device
-            ).view(-1, 1, 1).expand(-1, seq_len, seq_len)
-            flat_row_indices = edge_index[:, :, [0]]
-            flat_col_indices = edge_index[:, :, [1]]
-
-            edge_mask[flat_batch_indices, flat_row_indices, flat_col_indices] = True
-            edge_mask[flat_batch_indices, flat_col_indices, flat_row_indices] = True
-            edge_mask = edge_mask.view(batch_size, n, seq_len, seq_len)
+            edge_index = torch.stack([actions_flat, torch.roll(actions_flat, shifts=-1, dims=1)], dim=2)
+            row = edge_index[:, :, 0]
+            col = edge_index[:, :, 1]
+            batch_indices = torch.arange(batch_size * n, device=actions.device).view(-1, 1).expand(-1, seq_len)
+            linear_indices_forward = batch_indices * (seq_len * seq_len) + row * seq_len + col
+            linear_indices_backward = batch_indices * (seq_len * seq_len) + col * seq_len + row
+            linear_indices = torch.cat([linear_indices_forward, linear_indices_backward], dim=1).reshape(-1)
+            total_elements = batch_size * n * seq_len * seq_len
+            edge_mask_flat = torch.zeros(total_elements, dtype=torch.bool, device=actions.device)
+            edge_mask_flat[linear_indices] = True
+            edge_mask = edge_mask_flat.view(batch_size, n, seq_len, seq_len)
             # edge_mask.shape == (batch_size, n, seq_len, seq_len)
 
-            mask_flat = edge_mask.view(batch_size, n, -1).float()
-            # mask_flat.shape == (batch_size, n, seq_len * seq_len)
-            pairwise_sum = torch.matmul(mask_flat, mask_flat.transpose(1, 2))
+            # # Batch Version
+            # mask_flat = edge_mask.view(batch_size, n, -1).float()
+            # # mask_flat.shape == (batch_size, n, seq_len * seq_len)
+            # pairwise_sum = torch.matmul(mask_flat, mask_flat.transpose(1, 2))
+
+            # For-loop Version (to avoid OOM)
+            pairwise_sum = torch.zeros((batch_size, n, n), dtype=torch.float, device=actions.device)
+            for b in range(batch_size):
+                _edges = edge_mask[b].view(n, -1).to(torch.float)
+                pairwise_sum[b] = torch.mm(_edges, _edges.transpose(0, 1))
+
             pairwise_distance = 1 - (pairwise_sum / (2 * seq_len))
             # pairwise_distance.shape == (batch_size, n, n)
             return pairwise_distance, edge_mask
@@ -372,12 +377,28 @@ class GA:
         # rank-based selection
         score_ranks = torch.argsort(torch.argsort(-population["reward"], dim=1), dim=1)
         weights = 1.0 / (self.rank_coefficient * self.n_population + score_ranks)
-        weights_expanded = cast(Tensor, batchify(weights, self.n_offspring))
-        parents_indices = torch.multinomial(weights_expanded, self.n_parents, replacement=False)
+        # weights.shape == (batch_size, n_population)
 
-        parents_edge_masks = cast(Tensor, batchify(population["edge_mask"], self.n_offspring))
-        batch_indices = torch.arange(
-            parents_edge_masks.size(0), device=parents_edge_masks.device
-        ).unsqueeze(1).expand(-1, self.n_parents)
-        selected_edge_masks = parents_edge_masks[batch_indices, parents_indices]
-        return selected_edge_masks.sum(1) > 0
+        # # Batch & Dense Version
+        # weights_expanded = cast(Tensor, batchify(weights, self.n_offspring))
+        # parents_indices = torch.multinomial(weights_expanded, self.n_parents, replacement=False)
+
+        # parents_edge_masks = cast(Tensor, batchify(population["edge_mask"], self.n_offspring))
+        # batch_indices = torch.arange(
+        #     parents_edge_masks.size(0), device=parents_edge_masks.device
+        # ).unsqueeze(1).expand(-1, self.n_parents)
+        # selected_edge_masks = parents_edge_masks[batch_indices, parents_indices]
+        # return selected_edge_masks.sum(1) > 0
+
+        # For-loop & Sparse Version (to avoid OOM)
+        parents_edge_masks = []
+        for _ in range(self.n_offspring):
+            parents_indices = torch.multinomial(weights, self.n_parents, replacement=False)
+            # parents_indices.shape == (batch_size, n_parents)
+            parents_edge_masks.append(
+                population["edge_mask"][
+                    self._batchindex.unsqueeze(1).expand(-1, self.n_parents), parents_indices
+                ].to_sparse_coo()
+            )
+        parents_edge_masks = torch.cat(parents_edge_masks, 0)
+        return parents_edge_masks.sum(1).bool()  # shape == (batch_size * n_offspring, seq_len)

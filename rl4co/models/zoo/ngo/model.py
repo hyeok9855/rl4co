@@ -75,8 +75,8 @@ class NGO(REINFORCE):
             log_likelihood: Log-likelihood tensor. If None, it is taken from `policy_out`
         """
         reward = policy_out["reward"]
-        n_particles = reward.size(1)
-        advantage = reward - reward.mean(dim=1, keepdim=True)
+        n_particles = reward.size(1)  # type: ignore
+        advantage = reward - reward.mean(dim=1, keepdim=True)  # type: ignore
 
         if self.train_with_local_search:
             ls_reward = policy_out["ls_reward"]
