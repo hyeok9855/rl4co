@@ -69,7 +69,7 @@ class GFACS(DeepACO):
     def beta(self) -> float:
         return self.beta_min + (self.beta_max - self.beta_min) * min(
             math.log(self.current_epoch + 1)
-            / math.log(self.trainer.max_epochs - self.beta_flat_epochs),
+            / math.log(self.trainer.max_epochs - self.beta_flat_epochs),  # type: ignore
             1.0,
         )
 
@@ -91,8 +91,8 @@ class GFACS(DeepACO):
             log_likelihood: Log-likelihood tensor. If None, it is taken from `policy_out`
         """
         reward = policy_out["reward"]
-        n_ants = reward.size(1)
-        advantage = reward - reward.mean(dim=1, keepdim=True)
+        n_ants = reward.size(1)  # type: ignore
+        advantage = reward - reward.mean(dim=1, keepdim=True)  # type: ignore
 
         if self.train_with_local_search:
             ls_reward = policy_out["ls_reward"]
@@ -142,5 +142,7 @@ class GFACS(DeepACO):
                     n_routes + 1
                 ) - n_multinode_routes * math.log(2)
                 return unbatchify(torch.from_numpy(log_b_p).to(actions.device), n_ants)
+            case "op" | "pctsp":
+                return math.log(1 / 2)
             case _:
                 raise ValueError(f"Unknown environment: {self.env.name}")

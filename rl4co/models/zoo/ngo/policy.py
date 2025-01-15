@@ -38,7 +38,8 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         temperature: Temperature for the softmax during decoding. Defaults to 1.0.
         ga_class: Class representing the GA algorithm to be used. Defaults to :class:`GA`.
         ga_kwargs: Additional arguments to be passed to the GA algorithm.
-        train_with_local_search: Whether to train with local search. Defaults to False.
+        train_with_local_search: Whether to train with local search. Defaults to True.
+        train_with_ga: Whether to train with genetic algorithm. Defaults to False.
         n_population: Number of populations to be used in the NGO algorithm. Can be an integer or dictionary. Defaults to 100.
         n_offspring: Number of offsprings to be used in the NGO algorithm. Can be an integer or dictionary. Defaults to 10.
         encoder_kwargs: Additional arguments to be passed to the encoder.
@@ -54,24 +55,41 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         ga_class: Optional[Type[GA]] = None,
         ga_kwargs: dict = {},
         train_with_local_search: bool = True,
+        train_with_ga: bool = False,
         n_population: Optional[Union[int, dict]] = None,
         n_offspring: Optional[Union[int, dict]] = None,
         n_iterations: Optional[Union[int, dict]] = None,
+        start_node: Optional[int] = None,
         **encoder_kwargs,
     ):
         if encoder is None:
             encoder_kwargs["z_out_dim"] = 2 if train_with_local_search else 1
             encoder = GFACSEncoder(env_name=env_name, **encoder_kwargs)
 
+        self.decode_type = "multistart_sampling" if env_name == "tsp" else "sampling"
+
         super().__init__(
             encoder=encoder,
             env_name=env_name,
             temperature=temperature,
-            train_decode_type="multistart_sampling",
-            val_decode_type="multistart_sampling",
-            test_decode_type="multistart_sampling",            
+            train_decode_type=self.decode_type,
+            val_decode_type=self.decode_type,
+            test_decode_type=self.decode_type,
         )
 
+        self.default_decoding_kwargs = {}
+        self.default_decoding_kwargs["select_best"] = False
+        if "multistart" in self.decode_type:
+            select_start_nodes_fn = partial(self.select_start_node_fn, start_node=start_node)
+            self.default_decoding_kwargs.update(
+                {"multistart": True, "select_start_nodes_fn": select_start_nodes_fn}
+            )
+        else:
+            self.default_decoding_kwargs.update(
+                {"multisample": True}
+            )
+
+        # For now, top_p and top_k are only used to filter logits (not passed to decoder)
         self.top_p = top_p
         self.top_k = top_k
 
@@ -80,9 +98,31 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         self.train_with_local_search = train_with_local_search
         if train_with_local_search:
             assert self.ga_kwargs.get("use_local_search", False)
+        self.train_with_ga = train_with_ga
+        if train_with_ga:
+            assert not self.train_with_local_search
         self.n_population = merge_with_defaults(n_population, train=30, val=30, test=100)
         self.n_offspring = merge_with_defaults(n_offspring, train=30, val=30, test=100)
         self.n_iterations = merge_with_defaults(n_iterations, train=1, val=5, test=10)
+
+    @staticmethod
+    def select_start_node_fn(
+        td: TensorDict, env: RL4COEnvBase, num_starts: int, start_node: Optional[int] = None
+    ):
+        if env.name == "tsp":
+            if start_node is not None:
+                # For now, only TSP supports explicitly setting the start node
+                return start_node * torch.ones(
+                    td.shape[0] * num_starts, dtype=torch.long, device=td.device
+                )
+            else:
+                # if start_node is not set, we use random start nodes
+                return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
+
+        raise ValueError(
+            f"Unsupported environment '{env.name}' for setting start node. "
+            "Use `sampling` instead of `multistart_sampling` as decoding_strategy."
+        )
 
     def forward(
         self,
@@ -98,7 +138,16 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         Forward method. During validation and testing, the policy runs the GA algorithm to construct solutions.
         See :class:`NonAutoregressivePolicy` for more details during the training phase.
         """
+        n_population = self.n_population[phase]
         n_offspring = self.n_offspring[phase]
+
+        heatmap, _, logZ = self.encoder(td_initial)
+
+        decoding_kwargs.update(self.default_decoding_kwargs)
+        decoding_kwargs.update(
+            {"num_starts": n_offspring} if "multistart" in self.decode_type else {"num_samples": n_offspring}
+        )
+
         # Instantiate environment if needed
         if (phase != "train" or self.train_with_local_search) and (env is None or isinstance(env, str)):
             env_name = self.env_name if env is None else env
@@ -108,25 +157,13 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
 
         if phase == "train":
             # Encoder: get encoder output and initial embeddings from initial state
-            hidden, init_embeds, logZ = self.encoder(td_initial)
             if self.train_with_local_search:
                 logZ, ls_logZ = logZ[:, [0]], logZ[:, [1]]
             else:
                 logZ = logZ[:, [0]]
 
-            select_start_nodes_fn = partial(
-                self.ga_class.select_start_node_fn, start_node=self.ga_kwargs.get("start_node", None)
-            )
-            decoding_kwargs.update(
-                {
-                    "select_start_nodes_fn": select_start_nodes_fn,
-                    # These are only for inference; TODO: Are they useful for training too?
-                    # "top_p": self.top_p,
-                    # "top_k": self.top_k,
-                }
-            )
             logprobs, actions, td, env = self.common_decoding(
-                "multistart_sampling", td_initial, env, hidden, n_offspring, actions, **decoding_kwargs
+                self.decode_type, td_initial, env, heatmap, actions, **decoding_kwargs
             )
             td.set("reward", env.get_reward(td, actions))
 
@@ -147,16 +184,13 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
             if self.train_with_local_search:
                 # TODO: Refactor this so that we don't need to use the ga object
                 ga = self.ga_class(
-                    hidden,
-                    n_population=self.n_population[phase],
-                    n_offspring=n_offspring,
-                    **self.ga_kwargs,
+                    heatmap, n_population=n_population, n_offspring=n_offspring, **self.ga_kwargs
                 )
                 ls_actions, ls_reward = ga.local_search(
                     batchify(td_initial, n_offspring), env, actions  # type:ignore
                 )
                 ls_logprobs, ls_actions, td, env = self.common_decoding(
-                    "evaluate", td_initial, env, hidden, n_offspring, ls_actions, **decoding_kwargs
+                    "evaluate", td_initial, env, heatmap, ls_actions, **decoding_kwargs
                 )
                 td.set("ls_reward", ls_reward)
                 outdict.update(
@@ -171,31 +205,61 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
                 )
                 if return_actions:
                     outdict["ls_actions"] = ls_actions
+
+            elif self.train_with_ga:
+                # Run GA
+                ga = self.ga_class(
+                    heatmap, n_population=n_population, n_offspring=n_offspring, **self.ga_kwargs
+                )
+                ga_actions, ga_reward = ga.run_for_training(
+                    td_initial, env, self.n_iterations[phase], decoding_kwargs, actions, td["reward"]
+                )
+                ga_decoding_kwargs = decoding_kwargs.copy()
+                ga_decoding_kwargs.update(
+                    {"num_starts": n_population}
+                    if "multistart" in self.decode_type
+                    else {"num_samples": n_population}
+                )
+                ga_logprobs, ga_actions, td, env = self.common_decoding(
+                    "evaluate", td_initial, env, heatmap, ga_actions.transpose(0, 1).flatten(0, 1),
+                    **ga_decoding_kwargs,
+                )
+
+                outdict["reward"] = torch.cat([outdict["reward"], ga_reward], dim=1)
+                outdict["log_likelihood"] = torch.cat(
+                    [
+                        outdict["log_likelihood"],
+                        unbatchify(  # type: ignore
+                            get_log_likelihood(ga_logprobs, ga_actions, td.get("mask", None), True),
+                            n_population,
+                        ),
+                    ],
+                    dim=1,
+                )
+                if return_actions:
+                    outdict["actions"] = torch.cat([outdict["actions"], ga_actions], dim=1)
+
             ########################################################################
 
             if return_hidden:
-                outdict["hidden"] = hidden
+                outdict["hidden"] = heatmap
 
             return outdict
 
-        heatmap_logits, _, _ = self.encoder(td_initial)
-        heatmap_logits /= self.temperature
+        heatmap /= self.temperature
 
         if self.top_k > 0:
-            self.top_k = min(self.top_k, heatmap_logits.size(-1))  # safety check
-            heatmap_logits = modify_logits_for_top_k_filtering(heatmap_logits, self.top_k)
+            self.top_k = min(self.top_k, heatmap.size(-1))  # safety check
+            heatmap = modify_logits_for_top_k_filtering(heatmap, self.top_k)
 
         if self.top_p > 0:
             assert self.top_p <= 1.0, "top-p should be in (0, 1]."
-            heatmap_logits = modify_logits_for_top_p_filtering(heatmap_logits, self.top_p)
+            heatmap = modify_logits_for_top_p_filtering(heatmap, self.top_p)
 
         ga = self.ga_class(
-            heatmap_logits,
-            n_population=self.n_population[phase],
-            n_offspring=n_offspring,
-            **self.ga_kwargs,
+            heatmap, n_population=n_population, n_offspring=n_offspring, **self.ga_kwargs
         )
-        td, actions, reward = ga.run(td_initial, env, self.n_iterations[phase])
+        td, actions, reward = ga.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
 
         out = {"reward": reward}
         if return_actions:
@@ -209,19 +273,15 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         td: TensorDict,
         env: RL4COEnvBase,
         hidden: TensorDict,
-        num_starts: int,
         actions: Optional[torch.Tensor] = None,
         max_steps: int = 1_000_000,
         **decoding_kwargs,
     ):
-        multistart = True if num_starts > 1 else False
         decoding_strategy: DecodingStrategy = get_decoding_strategy(
             decoding_strategy=decode_type,
             temperature=decoding_kwargs.pop("temperature", self.temperature),
             mask_logits=decoding_kwargs.pop("mask_logits", self.mask_logits),
             tanh_clipping=decoding_kwargs.pop("tanh_clipping", self.tanh_clipping),
-            num_starts=num_starts,
-            multistart=multistart,
             select_start_nodes_fn=decoding_kwargs.pop("select_start_nodes_fn", None),
             store_all_logp=decoding_kwargs.pop("store_all_logp", False),
             **decoding_kwargs,
@@ -230,13 +290,15 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
             assert decoding_strategy.name == "evaluate", "decoding strategy must be 'evaluate' when actions are provided"
 
         # Pre-decoding hook: used for the initial step(s) of the decoding strategy
-        td, env, num_starts = decoding_strategy.pre_decoder_hook(td, env, actions[:, 0] if actions is not None else None)
+        td, env, num_starts = decoding_strategy.pre_decoder_hook(
+            td, env, actions[:, 0] if actions is not None else None
+        )
 
         # Additionally call a decoder hook if needed before main decoding
         td, env, hidden = self.decoder.pre_decoder_hook(td, env, hidden, num_starts)
 
         # Main decoding: loop until all sequences are done
-        step = 1 if multistart else 0
+        step = 1 if "multistart" in self.decode_type else 0
         while not td["done"].all():
             logits, mask = self.decoder(td, hidden, num_starts)
             td = decoding_strategy.step(

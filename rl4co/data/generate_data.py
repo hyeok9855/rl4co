@@ -8,6 +8,9 @@ from typing import List, Union
 import numpy as np
 
 from rl4co.data.utils import check_extension
+from rl4co.envs.routing.cvrp.generator import CAPACITIES as CVRP_CAPACITIES
+from rl4co.envs.routing.op.generator import MAX_LENGTHS as OP_MAX_LENGTHS
+from rl4co.envs.routing.pctsp.generator import MAX_LENGTHS as PCTSP_MAX_LENGTHS
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
@@ -45,30 +48,12 @@ def generate_tsp_data(dataset_size, tsp_size):
 
 
 def generate_vrp_data(dataset_size, vrp_size, capacities=None):
-    # From Kool et al. 2019, Hottung et al. 2022, Kim et al. 2023
-    CAPACITIES = {
-        10: 20.0,
-        15: 25.0,
-        20: 30.0,
-        30: 33.0,
-        40: 37.0,
-        50: 40.0,
-        60: 43.0,
-        75: 45.0,
-        100: 50.0,
-        125: 55.0,
-        150: 60.0,
-        200: 70.0,
-        500: 100.0,
-        1000: 150.0,
-    }
-
     # If capacities are provided, replace keys in CAPACITIES with provided values if they exist
     if capacities is not None:
         for k, v in capacities.items():
-            if k in CAPACITIES:
+            if k in CVRP_CAPACITIES:
                 print(f"Replacing capacity for {k} with {v}")
-                CAPACITIES[k] = v
+                CVRP_CAPACITIES[k] = v
 
     return {
         "depot": np.random.uniform(size=(dataset_size, 2)).astype(
@@ -80,7 +65,7 @@ def generate_vrp_data(dataset_size, vrp_size, capacities=None):
         "demand": np.random.randint(1, 10, size=(dataset_size, vrp_size)).astype(
             np.float32
         ),  # Demand, uniform integer 1 ... 9
-        "capacity": np.full(dataset_size, CAPACITIES[vrp_size]).astype(np.float32),
+        "capacity": np.full(dataset_size, CVRP_CAPACITIES[vrp_size]).astype(np.float32),
     }  # Capacity, same for whole dataset
 
 
@@ -93,7 +78,7 @@ def generate_pdp_data(dataset_size, pdp_size):
     }
 
 
-def generate_op_data(dataset_size, op_size, prize_type="const", max_lengths=None):
+def generate_op_data(dataset_size, op_size, prize_type="const", max_length=None):
     depot = np.random.uniform(size=(dataset_size, 2))
     loc = np.random.uniform(size=(dataset_size, op_size, 2))
 
@@ -109,22 +94,35 @@ def generate_op_data(dataset_size, op_size, prize_type="const", max_lengths=None
             1 + (prize_ / prize_.max(axis=-1, keepdims=True) * 99).astype(int)
         ) / 100.0
 
+    loc = np.concatenate([depot[:, None, :], loc], axis=1)
+    prize = np.concatenate([np.zeros((dataset_size, 1)), prize], axis=1)
+
     # Max length is approximately half of optimal TSP tour, such that half (a bit more) of the nodes can be visited
     # which is maximally difficult as this has the largest number of possibilities
-    MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0}
-    max_lengths = MAX_LENGTHS if max_lengths is None else max_lengths
+    max_length = OP_MAX_LENGTHS[op_size] if max_length is None else max_length
+
+    # Support for heterogeneous max length if provided
+    if isinstance(max_length, float | int):
+        max_length = np.full((dataset_size,), max_length)
+    elif isinstance(max_length, np.ndarray):
+        assert max_length.shape[0] == dataset_size
+    else:
+        raise ValueError("max_lengths should be a float, int or np.ndarray")
+
+    max_length = max_length[..., None] - np.linalg.norm(loc[..., 0:1, :] - loc, ord=2, axis=-1) - 1e-6
 
     return {
         "depot": depot.astype(np.float32),
         "locs": loc.astype(np.float32),
         "prize": prize.astype(np.float32),
-        "max_length": np.full(dataset_size, max_lengths[op_size]).astype(np.float32),
+        "max_length": max_length.astype(np.float32),
     }
 
 
 def generate_pctsp_data(dataset_size, pctsp_size, penalty_factor=3, max_lengths=None):
     depot = np.random.uniform(size=(dataset_size, 2))
     loc = np.random.uniform(size=(dataset_size, pctsp_size, 2))
+    loc = np.concatenate([depot[:, None, :], loc], axis=1)
 
     # For the penalty to make sense it should be not too large (in which case all nodes will be visited) nor too small
     # so we want the objective term to be approximately equal to the length of the tour, which we estimate with half
@@ -133,10 +131,10 @@ def generate_pctsp_data(dataset_size, pctsp_size, penalty_factor=3, max_lengths=
     # The expected total (uniform) penalty of half of the nodes (since approx half will be visited by the constraint)
     # is (n / 2) / 2 = n / 4 so divide by this means multiply by 4 / n,
     # However instead of 4 we use penalty_factor (3 works well) so we can make them larger or smaller
-    MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0}
-    max_lengths = MAX_LENGTHS if max_lengths is None else max_lengths
-    penalty_max = max_lengths[pctsp_size] * (penalty_factor) / float(pctsp_size)
+    max_lengths = PCTSP_MAX_LENGTHS[pctsp_size] if max_lengths is None else max_lengths
+    penalty_max = max_lengths * (penalty_factor) / float(pctsp_size)
     penalty = np.random.uniform(size=(dataset_size, pctsp_size)) * penalty_max
+    penalty = np.concatenate([np.zeros((dataset_size, 1)), penalty], axis=1)
 
     # Take uniform prizes
     # Now expectation is 0.5 so expected total prize is n / 2, we want to force to visit approximately half of the nodes
@@ -366,8 +364,7 @@ if __name__ == "__main__":
         "--problem",
         type=str,
         default="all",
-        help="Problem, 'tsp', 'vrp', 'pctsp' or 'op_const', 'op_unif' or 'op_dist'"
-        " or 'all' to generate all",
+        help="Problem, 'tsp', 'vrp', 'pctsp', 'op', or 'all' to generate all",
     )
     parser.add_argument(
         "--data_distribution",

@@ -1,6 +1,5 @@
 from functools import partial
 from typing import Optional, Type, Union
-import math
 
 from tensordict import TensorDict
 import torch
@@ -13,7 +12,7 @@ from rl4co.models.common.constructive.nonautoregressive import (
 from rl4co.models.zoo.deepaco.antsystem import AntSystem
 from rl4co.models.zoo.nargnn.encoder import NARGNNEncoder
 from rl4co.utils.decoding import modify_logits_for_top_k_filtering, modify_logits_for_top_p_filtering
-from rl4co.utils.ops import batchify, get_distance_matrix, unbatchify
+from rl4co.utils.ops import batchify, unbatchify
 from rl4co.utils.utils import merge_with_defaults
 
 
@@ -46,20 +45,36 @@ class DeepACOPolicy(NonAutoregressivePolicy):
         train_with_local_search: bool = False,
         n_ants: Optional[Union[int, dict]] = None,
         n_iterations: Optional[Union[int, dict]] = None,
+        start_node: Optional[int] = None,
         **encoder_kwargs,
     ):
         if encoder is None:
             encoder = NARGNNEncoder(env_name=env_name, **encoder_kwargs)
 
-        super(DeepACOPolicy, self).__init__(
+        self.decode_type = "multistart_sampling" if env_name == "tsp" else "sampling"
+
+        super().__init__(
             encoder=encoder,
             env_name=env_name,
             temperature=temperature,
-            train_decode_type="multistart_sampling",
-            val_decode_type="multistart_sampling",
-            test_decode_type="multistart_sampling",
+            train_decode_type=self.decode_type,
+            val_decode_type=self.decode_type,
+            test_decode_type=self.decode_type,
         )
 
+        self.default_decoding_kwargs = {}
+        self.default_decoding_kwargs["select_best"] = False
+        if "multistart" in self.decode_type:
+            select_start_nodes_fn = partial(self.select_start_node_fn, start_node=start_node)
+            self.default_decoding_kwargs.update(
+                {"multistart": True, "select_start_nodes_fn": select_start_nodes_fn}
+            )
+        else:
+            self.default_decoding_kwargs.update(
+                {"multisample": True}
+            )
+
+        # For now, top_p and top_k are only used to filter logits (not passed to decoder)
         self.top_p = top_p
         self.top_k = top_k
 
@@ -70,8 +85,25 @@ class DeepACOPolicy(NonAutoregressivePolicy):
             assert self.aco_kwargs.get("use_local_search", False)
         self.n_ants = merge_with_defaults(n_ants, train=30, val=48, test=48)
         self.n_iterations = merge_with_defaults(n_iterations, train=1, val=5, test=10)
-        self.top_p = top_p
-        self.top_k = top_k
+
+    @staticmethod
+    def select_start_node_fn(
+        td: TensorDict, env: RL4COEnvBase, num_starts: int, start_node: Optional[int] = None
+    ):
+        if env.name == "tsp":
+            if start_node is not None:
+                # For now, only TSP supports explicitly setting the start node
+                return start_node * torch.ones(
+                    td.shape[0] * num_starts, dtype=torch.long, device=td.device
+                )
+            else:
+                # if start_node is not set, we use random start nodes
+                return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
+
+        raise ValueError(
+            f"Unsupported environment '{env.name}' for setting start node. "
+            "Use `sampling` instead of `multistart_sampling` as decoding_strategy."
+        )
 
     def forward(
         self,
@@ -88,6 +120,12 @@ class DeepACOPolicy(NonAutoregressivePolicy):
         See :class:`NonAutoregressivePolicy` for more details during the training phase.
         """
         n_ants = self.n_ants[phase]
+
+        decoding_kwargs.update(self.default_decoding_kwargs)
+        decoding_kwargs.update(
+            {"num_starts": n_ants} if "multistart" in self.decode_type else {"num_samples": n_ants}
+        )
+
         # Instantiate environment if needed
         if (phase != "train" or self.train_with_local_search) and (env is None or isinstance(env, str)):
             env_name = self.env_name if env is None else env
@@ -96,28 +134,15 @@ class DeepACOPolicy(NonAutoregressivePolicy):
             assert isinstance(env, RL4COEnvBase), "env must be an instance of RL4COEnvBase"
 
         if phase == "train":
-            select_start_nodes_fn = partial(
-                self.aco_class.select_start_node_fn, start_node=self.aco_kwargs.get("start_node", None)
-            )
-            decoding_kwargs.update(
-                {
-                    "select_start_nodes_fn": select_start_nodes_fn,
-                    # TODO: Are they useful for training too?
-                    # "top_p": self.top_p,
-                    # "top_k": self.top_k,
-                }
-            )
             #  we just use the constructive policy
             outdict = super().forward(
                 td_initial,
                 env,
                 phase=phase,
-                decode_type="multistart_sampling",
                 calc_reward=True,
-                num_starts=n_ants,
-                actions=actions,
                 return_actions=return_actions,
                 return_hidden=return_hidden,
+                actions=actions,
                 **decoding_kwargs,
             )
 
@@ -135,19 +160,19 @@ class DeepACOPolicy(NonAutoregressivePolicy):
             outdict["log_likelihood"] = unbatchify(outdict["log_likelihood"], n_ants)
             return outdict
 
-        heatmap_logits, _ = self.encoder(td_initial)
-        heatmap_logits /= self.temperature
+        heatmap, _ = self.encoder(td_initial)
+        heatmap /= self.temperature
 
         if self.top_k > 0:
-            self.top_k = min(self.top_k, heatmap_logits.size(-1))  # safety check
-            heatmap_logits = modify_logits_for_top_k_filtering(heatmap_logits, self.top_k)
+            self.top_k = min(self.top_k, heatmap.size(-1))  # safety check
+            heatmap = modify_logits_for_top_k_filtering(heatmap, self.top_k)
 
         if self.top_p > 0:
             assert self.top_p <= 1.0, "top-p should be in (0, 1]."
-            heatmap_logits = modify_logits_for_top_p_filtering(heatmap_logits, self.top_p)
+            heatmap = modify_logits_for_top_p_filtering(heatmap, self.top_p)
 
-        aco = self.aco_class(heatmap_logits, n_ants=n_ants, **self.aco_kwargs)
-        td, actions, reward = aco.run(td_initial, env, self.n_iterations[phase])
+        aco = self.aco_class(heatmap, n_ants=n_ants, **self.aco_kwargs)
+        _, actions, reward = aco.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
 
         out = {"reward": reward}
         if return_actions:

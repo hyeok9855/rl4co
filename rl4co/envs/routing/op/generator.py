@@ -10,8 +10,8 @@ from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
 
-# From Kool et al. 2019
-MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0}
+# From AM (Kool et al. 2019) and GFACS (Kim et al. 2024)
+MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0, 200: 5.0, 500: 7.0, 1000: 10.0}
 
 
 class OPGenerator(Generator):
@@ -104,13 +104,11 @@ class OPGenerator(Generator):
         if self.depot_sampler is not None:
             depot = self.depot_sampler.sample((*batch_size, 2))
             locs = self.loc_sampler.sample((*batch_size, self.num_loc, 2))
+            locs = torch.cat([depot[..., None, :], locs], dim=-2)
         else:
             # if depot_sampler is None, sample the depot from the locations
             locs = self.loc_sampler.sample((*batch_size, self.num_loc + 1, 2))
             depot = locs[..., 0, :]
-            locs = locs[..., 1:, :]
-
-        locs_with_depot = torch.cat((depot.unsqueeze(1), locs), dim=1)
 
         # Methods taken from Fischetti et al. (1998) and Kool et al. (2019)
         if self.prize_type == "const":
@@ -123,7 +121,7 @@ class OPGenerator(Generator):
                 ).float()
             ) / 100
         elif self.prize_type == "dist":  # based on the distance to the depot
-            prize = (locs_with_depot[..., 0:1, :] - locs_with_depot[..., 1:, :]).norm(
+            prize = (locs[..., 0:1, :] - locs[..., 1:, :]).norm(
                 p=2, dim=-1
             )
             prize = (
@@ -132,16 +130,21 @@ class OPGenerator(Generator):
         else:
             raise ValueError(f"Invalid prize_type: {self.prize_type}")
 
+        prize = torch.cat([torch.zeros_like(prize[..., :1]), prize], dim=-1)
+
         # Support for heterogeneous max length if provided
         if not isinstance(self.max_length, torch.Tensor):
             max_length = torch.full((*batch_size,), self.max_length)
         else:
             max_length = self.max_length
+            assert max_length.size() == (*batch_size,)
+
+        max_length = max_length[..., None] - (locs[..., 0:1, :] - locs).norm(p=2, dim=-1) - 1e-6
 
         return TensorDict(
             {
-                "locs": locs_with_depot[..., 1:, :],
-                "depot": locs_with_depot[..., 0, :],
+                "locs": locs,
+                "depot": depot,
                 "prize": prize,
                 "max_length": max_length,
             },

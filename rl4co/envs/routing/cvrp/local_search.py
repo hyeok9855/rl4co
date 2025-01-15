@@ -47,7 +47,9 @@ except FileNotFoundError:
     log.info("HGS-CVRP is installed successfully.")
 
 
-def local_search(td: TensorDict, actions: torch.Tensor, max_iterations: int = 1000) -> torch.Tensor:
+def local_search(
+    td: TensorDict, actions: torch.Tensor, max_iterations: int = 1000, **kwargs
+) -> torch.Tensor:
     """
     Improve the solution using local search for CVRP, based on PyVRP.
 

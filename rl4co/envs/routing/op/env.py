@@ -110,21 +110,17 @@ class OPEnv(RL4COEnvBase):
         device = td.device
 
         # Add depot to locs
-        locs_with_depot = torch.cat((td["depot"][:, None, :], td["locs"]), -2)
+        locs_with_depot = td["locs"]
 
         # Create reset TensorDict
         td_reset = TensorDict(
             {
                 "locs": locs_with_depot,
-                "prize": F.pad(
-                    td["prize"], (1, 0), mode="constant", value=0
-                ),  # add 0 for depot
+                "prize": td["prize"],  # 0 for depot
                 "tour_length": torch.zeros(*batch_size, device=device),
                 # max_length is max length allowed when arriving at node, so subtract distance to return to depot
                 # Additionally, substract epsilon margin for numeric stability
-                "max_length": td["max_length"][..., None]
-                - (td["depot"][..., None, :] - locs_with_depot).norm(p=2, dim=-1)
-                - 1e-6,
+                "max_length": td["max_length"],
                 "current_node": torch.zeros(
                     *batch_size, 1, dtype=torch.long, device=device
                 ),

@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import scipy
@@ -20,7 +20,8 @@ class NGO(REINFORCE):
         env: Environment to use for the algorithm
         policy: Policy to use for the algorithm
         baseline: REINFORCE baseline. Defaults to no baseline
-        train_with_local_search: Whether to train with local search. Defaults to False.
+        train_with_local_search: Whether to train with local search. Defaults to True.
+        train_with_ga: Whether to train with genetic algorithm. Defaults to False.
         ls_reward_aug_W: Coefficient to be used for the reward augmentation with the local search. Defaults to 0.95.
         policy_kwargs: Keyword arguments for policy
         baseline_kwargs: Keyword arguments for baseline
@@ -33,6 +34,7 @@ class NGO(REINFORCE):
         policy: Optional[NGONonAutoregressivePolicy] = None,
         baseline: Union[REINFORCEBaseline, str] = "no",
         train_with_local_search: bool = True,
+        train_with_ga: bool = False,
         ls_reward_aug_W: float = 0.95,
         policy_kwargs: dict = {},
         baseline_kwargs: dict = {},
@@ -43,7 +45,10 @@ class NGO(REINFORCE):
     ):
         if policy is None:
             policy = NGONonAutoregressivePolicy(
-                env_name=env.name, train_with_local_search=train_with_local_search, **policy_kwargs
+                env_name=env.name,
+                train_with_local_search=train_with_local_search,
+                train_with_ga=train_with_ga,
+                **policy_kwargs
             )
 
         super().__init__(
@@ -56,6 +61,28 @@ class NGO(REINFORCE):
         self.beta_min = beta_min
         self.beta_max = beta_max
         self.beta_flat_epochs = beta_flat_epochs
+
+    @property
+    def beta(self) -> float:
+        return self.beta_min + (self.beta_max - self.beta_min) * min(
+            math.log(self.current_epoch + 1)
+            / math.log(self.trainer.max_epochs - self.beta_flat_epochs),  # type: ignore
+            1.0,
+        )
+
+    def shared_step(
+        self, batch: Any, batch_idx: int, phase: str, dataloader_idx: Optional[int] = None
+    ):
+        td = self.env.reset(batch)
+        # Perform forward pass (i.e., constructing solution and computing log-likelihoods)
+        out = self.policy(td, self.env, phase=phase)
+
+        # Compute loss
+        if phase == "train":
+            out["loss"] = self.calculate_loss(td, batch, out)
+
+        metrics = self.log_metrics(out, phase, dataloader_idx=dataloader_idx)
+        return {"loss": out.get("loss", None), **metrics}
 
     def calculate_loss(
         self,
@@ -113,5 +140,7 @@ class NGO(REINFORCE):
                 n_multinode_routes = np.count_nonzero(_a3, axis=1) - n_nodes
                 log_b_p = - scipy.special.gammaln(n_routes + 1) - n_multinode_routes * math.log(2)
                 return unbatchify(torch.from_numpy(log_b_p).to(actions.device), n_particles)
+            case "op" | "pctsp":
+                return math.log(1 / 2)
             case _:
                 raise ValueError(f"Unknown environment: {self.env.name}")

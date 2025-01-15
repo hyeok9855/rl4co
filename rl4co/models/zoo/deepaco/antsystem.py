@@ -1,7 +1,6 @@
-from functools import lru_cache, cached_property, partial
+from functools import lru_cache, cached_property
 from typing import Optional, Tuple
 
-import numpy as np
 import torch
 
 from tensordict import TensorDict
@@ -12,7 +11,7 @@ from rl4co.models.common.constructive.nonautoregressive.decoder import (
     NonAutoregressiveDecoder,
 )
 from rl4co.utils.decoding import Sampling
-from rl4co.utils.ops import get_distance_matrix, unbatchify
+from rl4co.utils.ops import batchify, get_distance_matrix, unbatchify
 
 
 class AntSystem:
@@ -47,7 +46,6 @@ class AntSystem:
         n_perturbations: int = 5,
         local_search_params: dict = {},
         perturbation_params: dict = {},
-        start_node: Optional[int] = None,
     ):
         self.batch_size = log_heuristic.shape[0]
         self.n_ants = n_ants
@@ -71,9 +69,8 @@ class AntSystem:
         assert not (use_nls and not use_local_search), "use_nls requires use_local_search"
         self.use_nls = use_nls
         self.n_perturbations = n_perturbations
-        self.local_search_params = local_search_params
-        self.perturbation_params = perturbation_params
-        self.start_node = start_node
+        self.local_search_params = local_search_params.copy()  # needs to be copied to avoid side effects
+        self.perturbation_params = perturbation_params.copy()
 
         self._batchindex = torch.arange(self.batch_size, device=log_heuristic.device)
 
@@ -84,24 +81,12 @@ class AntSystem:
         heuristic_dist[:, torch.arange(heuristic_dist.shape[1]), torch.arange(heuristic_dist.shape[2])] = 0
         return heuristic_dist
 
-    @staticmethod
-    def select_start_node_fn(
-        td: TensorDict, env: RL4COEnvBase, num_starts: int, start_node: Optional[int] = None
-    ):
-        if env.name == "tsp" and start_node is not None:
-            # For now, only TSP supports explicitly setting the start node
-            return start_node * torch.ones(
-                td.shape[0] * num_starts, dtype=torch.long, device=td.device
-            )
-
-        # if start_node is not set, we use random start nodes
-        return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
-
     def run(
         self,
         td_initial: TensorDict,
         env: RL4COEnvBase,
         n_iterations: int,
+        decoding_kwargs: dict,
     ) -> Tuple[TensorDict, Tensor, Tensor]:
         """Run the Ant System algorithm for a specified number of iterations.
 
@@ -118,7 +103,7 @@ class AntSystem:
         for _ in range(n_iterations):
             # reset environment
             td = td_initial.clone()
-            self._one_step(td, env)
+            self._one_step(td, env, decoding_kwargs)
 
         assert self.final_reward is not None
         action_matrix = self._convert_final_action_to_matrix()
@@ -126,7 +111,7 @@ class AntSystem:
 
         return td, action_matrix, self.final_reward
 
-    def _one_step(self, td: TensorDict, env: RL4COEnvBase):
+    def _one_step(self, td: TensorDict, env: RL4COEnvBase, decoding_kwargs: dict):
         """Run one step of the Ant System algorithm.
 
         Args:
@@ -138,10 +123,10 @@ class AntSystem:
             reward: The reward achieved by the algorithm.
         """
         # sampling
-        td, env, actions, reward = self._sampling(td, env)
+        td, env, actions, reward = self._sampling(td, env, decoding_kwargs)
         # local search, reserved for extensions
         if self.use_local_search:
-            actions, reward = self.local_search(td, env, actions)
+            actions, reward = self.local_search(td, env, actions, decoding_kwargs)
 
         # reshape from (batch_size * n_ants, ...) to (batch_size, n_ants, ...)
         reward = unbatchify(reward, self.n_ants)
@@ -158,17 +143,14 @@ class AntSystem:
         self,
         td: TensorDict,
         env: RL4COEnvBase,
+        decoding_kwargs: dict,
     ):
         # Sample from heatmaps
         # p = phe**alpha * heu**beta <==> log(p) = alpha*log(phe) + beta*log(heu)
         heatmaps_logits = (
             self.alpha * torch.log(self.pheromone) + self.beta * self.log_heuristic
         )
-        decode_strategy = Sampling(
-            multistart=True,
-            num_starts=self.n_ants,
-            select_start_nodes_fn=partial(self.select_start_node_fn, start_node=self.start_node),
-        )
+        decode_strategy = Sampling(**decoding_kwargs)
 
         td, env, num_starts = decode_strategy.pre_decoder_hook(td, env)
         while not td["done"].all():
@@ -184,7 +166,7 @@ class AntSystem:
         return td, env, actions, reward
 
     def local_search(
-        self, td: TensorDict, env: RL4COEnvBase, actions: Tensor
+        self, td: TensorDict, env: RL4COEnvBase, actions: Tensor, decoding_kwargs: dict
     ) -> Tuple[Tensor, Tensor]:
         """Perform local search on the actions and reward obtained.
 
@@ -197,31 +179,39 @@ class AntSystem:
             actions: The modified actions
             reward: The modified reward
         """
-        td_cpu = td.detach().cpu()  # Convert to CPU in advance to minimize the overhead from device transfer
-        td_cpu["distances"] = get_distance_matrix(td_cpu["locs"])
-        # TODO: avoid or generalize this, e.g., pre-compute for local search in each env
-        actions = actions.detach().cpu()
-        best_actions = env.local_search(td=td_cpu, actions=actions, **self.local_search_params)
-        best_rewards = env.get_reward(td_cpu, best_actions)
+        device = td.device
+        if env.name in ["tsp", "cvrp"]:
+            # Convert to CPU in advance to minimize the overhead from device transfer
+            td = td.detach().cpu()
+            # TODO: avoid or generalize this, e.g., pre-compute for local search in each env
+            td["distances"] = get_distance_matrix(td["locs"])
+            actions = actions.detach().cpu()
+        else:
+            raise NotImplementedError(f"Local search not implemented for {env.name}")
+
+        best_actions = env.local_search(td=td, actions=actions, **self.local_search_params)
+        best_rewards = env.get_reward(td, best_actions)
 
         if self.use_nls:
-            td_cpu_perturb = td_cpu.clone()
-            td_cpu_perturb["distances"] = torch.tile(self.heuristic_dist, (self.n_ants, 1, 1))
+            td_perturb = td.clone()
+            td_perturb["distances"] = torch.tile(self.heuristic_dist, (self.n_ants, 1, 1))
             new_actions = best_actions.clone()
 
             for _ in range(self.n_perturbations):
                 perturbed_actions = env.local_search(
-                    td=td_cpu_perturb, actions=new_actions, **self.perturbation_params
+                    td=td_perturb, actions=new_actions, **self.perturbation_params
                 )
-                new_actions = env.local_search(td=td_cpu, actions=perturbed_actions, **self.local_search_params)
-                new_rewards = env.get_reward(td_cpu, new_actions)
+                new_actions = env.local_search(
+                    td=td, actions=perturbed_actions, **self.local_search_params
+                )
+                new_rewards = env.get_reward(td, new_actions)
 
                 improved_indices = new_rewards > best_rewards
                 best_actions = env.replace_selected_actions(best_actions, new_actions, improved_indices)
                 best_rewards[improved_indices] = new_rewards[improved_indices]
 
-        best_actions = best_actions.to(td.device)
-        best_rewards = best_rewards.to(td.device)
+        best_actions = best_actions.to(device)
+        best_rewards = best_rewards.to(device)
 
         return best_actions, best_rewards
 
