@@ -1,14 +1,10 @@
 from functools import partial
 from typing import Optional, Type, Union
-import math
 
 from tensordict import TensorDict
 import torch
 
 from rl4co.envs import RL4COEnvBase, get_env
-from rl4co.models.common.constructive.autoregressive import (
-    AutoregressiveEncoder, AutoregressiveDecoder, AutoregressivePolicy
-)
 from rl4co.models.common.constructive.nonautoregressive import (
     NonAutoregressiveEncoder, NonAutoregressivePolicy
 )
@@ -60,10 +56,12 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         n_offspring: Optional[Union[int, dict]] = None,
         n_iterations: Optional[Union[int, dict]] = None,
         start_node: Optional[int] = None,
+        k_sparse: Optional[int] = None,
         **encoder_kwargs,
     ):
         if encoder is None:
             encoder_kwargs["z_out_dim"] = 2 if train_with_local_search else 1
+            encoder_kwargs["k_sparse"] = k_sparse
             encoder = GFACSEncoder(env_name=env_name, **encoder_kwargs)
 
         self.decode_type = "multistart_sampling" if env_name == "tsp" else "sampling"
@@ -79,6 +77,8 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
 
         self.default_decoding_kwargs = {}
         self.default_decoding_kwargs["select_best"] = False
+        if k_sparse is not None:
+            self.default_decoding_kwargs["top_k"] = k_sparse + (0 if env_name == "tsp" else 1)  # 1 for depot
         if "multistart" in self.decode_type:
             select_start_nodes_fn = partial(self.select_start_node_fn, start_node=start_node)
             self.default_decoding_kwargs.update(
@@ -109,20 +109,12 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
     def select_start_node_fn(
         td: TensorDict, env: RL4COEnvBase, num_starts: int, start_node: Optional[int] = None
     ):
-        if env.name == "tsp":
-            if start_node is not None:
-                # For now, only TSP supports explicitly setting the start node
-                return start_node * torch.ones(
-                    td.shape[0] * num_starts, dtype=torch.long, device=td.device
-                )
-            else:
-                # if start_node is not set, we use random start nodes
-                return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
-
-        raise ValueError(
-            f"Unsupported environment '{env.name}' for setting start node. "
-            "Use `sampling` instead of `multistart_sampling` as decoding_strategy."
-        )
+        if env.name == "tsp" and start_node is not None:
+            # For now, only TSP supports explicitly setting the start node
+            return start_node * torch.ones(
+                td.shape[0] * num_starts, dtype=torch.long, device=td.device
+            )
+        return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
 
     def forward(
         self,
@@ -187,10 +179,12 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
                     heatmap, n_population=n_population, n_offspring=n_offspring, **self.ga_kwargs
                 )
                 ls_actions, ls_reward = ga.local_search(
-                    batchify(td_initial, n_offspring), env, actions  # type:ignore
+                    batchify(td_initial, n_offspring), env, actions, decoding_kwargs  # type:ignore
                 )
+                ls_decoding_kwargs = decoding_kwargs.copy()
+                ls_decoding_kwargs["top_k"] = 0  # This should be 0, otherwise logprobs can be -inf
                 ls_logprobs, ls_actions, td, env = self.common_decoding(
-                    "evaluate", td_initial, env, heatmap, ls_actions, **decoding_kwargs
+                    "evaluate", td_initial, env, heatmap, ls_actions, **ls_decoding_kwargs
                 )
                 td.set("ls_reward", ls_reward)
                 outdict.update(
@@ -259,9 +253,10 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
         ga = self.ga_class(
             heatmap, n_population=n_population, n_offspring=n_offspring, **self.ga_kwargs
         )
-        td, actions, reward = ga.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
+        actions, iter_rewards = ga.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
 
-        out = {"reward": reward}
+        out = {"reward": iter_rewards[self.n_iterations[phase] - 1]}
+        out.update({f"reward_{i:03d}": iter_rewards[i] for i in range(self.n_iterations[phase])})
         if return_actions:
             out["actions"] = actions
 

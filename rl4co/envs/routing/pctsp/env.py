@@ -273,6 +273,10 @@ class PCTSPEnv(RL4COEnvBase):
         self.reward_spec = Unbounded(shape=(1,))
         self.done_spec = Unbounded(shape=(1,), dtype=torch.bool)
 
+    def local_search(self, td: TensorDict, actions: torch.Tensor, **kwargs) -> torch.Tensor:
+        from .local_search import local_search  # Lazy import to avoid circular imports
+        return local_search(self, td, actions, **kwargs)
+
     @staticmethod
     def render(td: TensorDict, actions: torch.Tensor = None, ax=None):
         return render(td, actions, ax)

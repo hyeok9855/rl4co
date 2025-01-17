@@ -5,6 +5,7 @@ import torch
 
 from tensordict import TensorDict
 from torch import Tensor
+from tqdm import trange
 
 from rl4co.envs import RL4COEnvBase
 from rl4co.models.common.constructive.nonautoregressive.decoder import (
@@ -25,7 +26,10 @@ class GA:
         n_population: Number of individuals in the population. Defaults to 100.
         n_offspring: Number of offspring to be generated. Defaults to 100.
             Note that each pair of parents generates only one offspring.
+        n_parents: Number of parents to be selected for mating. Defaults to 2.
         mutation_rate: Rate of mutation. Defaults to 0.01.
+        rank_coefficient: Coefficient to be used for the rank-based selection. Defaults to 0.01.
+        novelty_rank_w: Weight for novelty to be used for weighted rank-based selection. Defaults to 0.0.
         use_local_search: Whether to use local_search provided by the env. Default to False.
         use_nls: Whether to use neural-guided local search provided by the env. Default to False.
         n_perturbations: Number of perturbations to be used for nls. Defaults to 5.
@@ -44,7 +48,7 @@ class GA:
         novelty_rank_w: float = 0.0,
         use_local_search: bool = False,
         use_nls: bool = False,
-        n_perturbations: int = 5,
+        n_perturbations: int = 1,
         local_search_params: dict = {},
         perturbation_params: dict = {},
     ):
@@ -60,7 +64,7 @@ class GA:
         self.novelty_rank_w = novelty_rank_w
 
         self.final_actions = self.final_reward = None
-        self.final_reward_cache = torch.zeros(self.batch_size, 0, device=log_heuristic.device)
+        self.final_reward_cache: dict = {}
 
         self.use_local_search = use_local_search
         assert not (use_nls and not use_local_search), "use_nls requires use_local_search"
@@ -84,7 +88,7 @@ class GA:
         env: RL4COEnvBase,
         n_iterations: int,
         decoding_kwargs: dict,
-    ) -> Tuple[TensorDict, Tensor, Tensor]:
+    ) -> Tuple[Tensor, dict[int, Tensor]]:
         """Run the NGO algorithm for a specified number of iterations.
 
         Args:
@@ -105,16 +109,15 @@ class GA:
             "novelty": torch.zeros(0, dtype=torch.float, device=td_initial.device),
         }
 
-        for _ in range(n_iterations):
+        for i in (pbar := trange(n_iterations, dynamic_ncols=True, desc="Running GA")):
             # reset environment
             td = td_initial.clone()
             _, _, population = self._one_step(td, env, population, decoding_kwargs)
+            self.final_reward_cache[i] = self.final_reward.clone()  # type: ignore
+            pbar.set_postfix({"reward": self.final_reward.mean().item()})  # type: ignore
 
         action_matrix = self._convert_final_action_to_matrix()
-        assert action_matrix is not None and self.final_reward is not None
-        td, env = self._recreate_final_routes(td_initial, env, action_matrix)
-
-        return td, action_matrix, self.final_reward
+        return action_matrix, self.final_reward_cache
 
     def run_for_training(
         self,
@@ -257,6 +260,13 @@ class GA:
             # TODO: avoid or generalize this, e.g., pre-compute for local search in each env
             td["distances"] = get_distance_matrix(td["locs"])
             actions = actions.detach().cpu()
+        elif env.name in ["pctsp", "op"]:  # destroy & repair local search
+            self.local_search_params.update(
+                {
+                    "decoding_kwargs": decoding_kwargs,
+                    "heatmap": batchify(self.log_heuristic, self.n_offspring),
+                }
+            )
         else:
             raise NotImplementedError(f"Local search not implemented for {env.name}")
 
@@ -298,26 +308,13 @@ class GA:
         else:
             require_update = self._batchindex[self.final_reward <= best_reward]
             for index in require_update:
-                self.final_actions[index] = best_actions[index]
-            self.final_reward[require_update] = best_reward[require_update]
+                self.final_actions[index] = best_actions[index].clone()
+            self.final_reward[require_update] = best_reward[require_update].clone()
 
-        self.final_reward_cache = torch.cat(
-            [self.final_reward_cache, self.final_reward.unsqueeze(-1)], -1
-        )
         return best_index
 
-    def _recreate_final_routes(self, td, env, action_matrix):
-        for action_index in range(action_matrix.shape[-1]):
-            actions = action_matrix[:, action_index]
-            td.set("action", actions)
-            td = env.step(td)["next"]
-
-        assert td["done"].all()
-        return td, env
-
-    def _convert_final_action_to_matrix(self) -> Optional[Tensor]:
-        if self.final_actions is None:
-            return None
+    def _convert_final_action_to_matrix(self) -> Tensor:
+        assert self.final_actions is not None
         action_count = max(len(actions) for actions in self.final_actions)
         mat_actions = torch.zeros(
             (self.batch_size, action_count),

@@ -46,12 +46,15 @@ class DeepACOPolicy(NonAutoregressivePolicy):
         n_ants: Optional[Union[int, dict]] = None,
         n_iterations: Optional[Union[int, dict]] = None,
         start_node: Optional[int] = None,
+        multistart: bool = False,
+        k_sparse: Optional[int] = None,
         **encoder_kwargs,
     ):
         if encoder is None:
+            encoder_kwargs["k_sparse"] = k_sparse
             encoder = NARGNNEncoder(env_name=env_name, **encoder_kwargs)
 
-        self.decode_type = "multistart_sampling" if env_name == "tsp" else "sampling"
+        self.decode_type = "multistart_sampling" if env_name == "tsp" or multistart else "sampling"
 
         super().__init__(
             encoder=encoder,
@@ -64,6 +67,8 @@ class DeepACOPolicy(NonAutoregressivePolicy):
 
         self.default_decoding_kwargs = {}
         self.default_decoding_kwargs["select_best"] = False
+        if k_sparse is not None:
+            self.default_decoding_kwargs["top_k"] = k_sparse + (0 if env_name == "tsp" else 1)  # 1 for depot
         if "multistart" in self.decode_type:
             select_start_nodes_fn = partial(self.select_start_node_fn, start_node=start_node)
             self.default_decoding_kwargs.update(
@@ -90,20 +95,12 @@ class DeepACOPolicy(NonAutoregressivePolicy):
     def select_start_node_fn(
         td: TensorDict, env: RL4COEnvBase, num_starts: int, start_node: Optional[int] = None
     ):
-        if env.name == "tsp":
-            if start_node is not None:
-                # For now, only TSP supports explicitly setting the start node
-                return start_node * torch.ones(
-                    td.shape[0] * num_starts, dtype=torch.long, device=td.device
-                )
-            else:
-                # if start_node is not set, we use random start nodes
-                return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
-
-        raise ValueError(
-            f"Unsupported environment '{env.name}' for setting start node. "
-            "Use `sampling` instead of `multistart_sampling` as decoding_strategy."
-        )
+        if env.name == "tsp" and start_node is not None:
+            # For now, only TSP supports explicitly setting the start node
+            return start_node * torch.ones(
+                td.shape[0] * num_starts, dtype=torch.long, device=td.device
+            )
+        return torch.multinomial(td["action_mask"].float(), num_starts, replacement=True).view(-1)
 
     def forward(
         self,
@@ -172,9 +169,10 @@ class DeepACOPolicy(NonAutoregressivePolicy):
             heatmap = modify_logits_for_top_p_filtering(heatmap, self.top_p)
 
         aco = self.aco_class(heatmap, n_ants=n_ants, **self.aco_kwargs)
-        _, actions, reward = aco.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
+        actions, iter_rewards = aco.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
 
-        out = {"reward": reward}
+        out = {"reward": iter_rewards[self.n_iterations[phase] - 1]}
+        out.update({f"reward_{i:03d}": iter_rewards[i] for i in range(self.n_iterations[phase])})
         if return_actions:
             out["actions"] = actions
 

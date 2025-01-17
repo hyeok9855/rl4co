@@ -379,7 +379,7 @@ class Solver:
         assert dist_mtx.shape[0] == dist_mtx.shape[1]
         assert (dist_mtx >= 0.0).all()
 
-        callid = (time.time_ns()*10000+random.randint(0,10000))%C_INT_MAX
+        callid = (time.time_ns()*100000+random.randint(0,100000))%C_INT_MAX
 
         tmppath = "/tmp/route-{}".format(callid)
         resultpath = "/tmp/swapstar-result-{}".format(callid)

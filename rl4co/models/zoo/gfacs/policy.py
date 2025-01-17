@@ -50,10 +50,13 @@ class GFACSPolicy(DeepACOPolicy):
         train_with_local_search: bool = True,
         n_ants: Optional[Union[int, dict]] = None,
         n_iterations: Optional[Union[int, dict]] = None,
+        multistart: bool = False,
+        k_sparse: Optional[int] = None,
         **encoder_kwargs,
     ):
         if encoder is None:
             encoder_kwargs["z_out_dim"] = 2 if train_with_local_search else 1
+            encoder_kwargs["k_sparse"] = k_sparse
             encoder = GFACSEncoder(env_name=env_name, **encoder_kwargs)
 
         super().__init__(
@@ -67,6 +70,8 @@ class GFACSPolicy(DeepACOPolicy):
             train_with_local_search=train_with_local_search,
             n_ants=n_ants,
             n_iterations=n_iterations,
+            multistart=multistart,
+            k_sparse=k_sparse,
         )
 
     def forward(
@@ -131,8 +136,10 @@ class GFACSPolicy(DeepACOPolicy):
                 ls_actions, ls_reward = aco.local_search(
                     batchify(td_initial, n_ants), env, actions, decoding_kwargs  # type:ignore
                 )
+                ls_decoding_kwargs = decoding_kwargs.copy()
+                ls_decoding_kwargs["top_k"] = 0  # This should be 0, otherwise logprobs can be -inf
                 ls_logprobs, ls_actions, td, env = self.common_decoding(
-                    "evaluate", td_initial, env, heatmap, ls_actions, **decoding_kwargs
+                    "evaluate", td_initial, env, heatmap, ls_actions, **ls_decoding_kwargs
                 )
                 td.set("ls_reward", ls_reward)
                 outdict.update(
@@ -165,9 +172,10 @@ class GFACSPolicy(DeepACOPolicy):
             heatmap = modify_logits_for_top_p_filtering(heatmap, self.top_p)
 
         aco = self.aco_class(heatmap, n_ants=n_ants, **self.aco_kwargs)
-        _, actions, reward = aco.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
+        actions, iter_rewards = aco.run(td_initial, env, self.n_iterations[phase], decoding_kwargs)
 
-        out = {"reward": reward}
+        out = {"reward": iter_rewards[self.n_iterations[phase] - 1]}
+        out.update({f"reward_{i:03d}": iter_rewards[i] for i in range(self.n_iterations[phase])})
         if return_actions:
             out["actions"] = actions
 
