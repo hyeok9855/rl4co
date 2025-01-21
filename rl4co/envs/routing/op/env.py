@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from tensordict.tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded

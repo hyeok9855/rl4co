@@ -78,9 +78,9 @@ class GA:
     @cached_property
     def heuristic_dist(self) -> torch.Tensor:
         heuristic = self.log_heuristic.exp().detach().cpu() + 1e-10
-        heuristic_dist = 1 / (heuristic / heuristic.max(-1, keepdim=True)[0] + 1e-5)
-        heuristic_dist[:, torch.arange(heuristic_dist.shape[1]), torch.arange(heuristic_dist.shape[2])] = 0
-        return heuristic_dist
+        heu_dist = 1 / (heuristic / heuristic.max(-1, keepdim=True)[0] + 1e-5)
+        heu_dist[:, torch.arange(heu_dist.shape[1]), torch.arange(heu_dist.shape[2])] = 0
+        return heu_dist
 
     def run(
         self,
@@ -88,6 +88,7 @@ class GA:
         env: RL4COEnvBase,
         n_iterations: int,
         decoding_kwargs: dict,
+        disable_tqdm: bool = False,
     ) -> Tuple[Tensor, dict[int, Tensor]]:
         """Run the NGO algorithm for a specified number of iterations.
 
@@ -109,12 +110,15 @@ class GA:
             "novelty": torch.zeros(0, dtype=torch.float, device=td_initial.device),
         }
 
-        for i in (pbar := trange(n_iterations, dynamic_ncols=True, desc="Running GA")):
+        pbar = trange(
+            n_iterations, dynamic_ncols=True, desc="Running GA", disable=disable_tqdm
+        )
+        for i in pbar:
             # reset environment
             td = td_initial.clone()
             _, _, population = self._one_step(td, env, population, decoding_kwargs)
             self.final_reward_cache[i] = self.final_reward.clone()  # type: ignore
-            pbar.set_postfix({"reward": self.final_reward.mean().item()})  # type: ignore
+            pbar.set_postfix({"reward": f"{self.final_reward.mean().item():.3f}"})  # type: ignore
 
         action_matrix = self._convert_final_action_to_matrix()
         return action_matrix, self.final_reward_cache
@@ -147,7 +151,9 @@ class GA:
             "novelty": torch.zeros(0, dtype=torch.float, device=td_initial.device),
         }
         if actions is not None:
-            assert actions.size(0) == reward.size(0) == self.batch_size * self.n_offspring  # type: ignore
+            assert (
+                actions.size(0) == reward.size(0) == self.batch_size * self.n_offspring  # type: ignore
+            )
 
             # reshape from (batch_size * n_offspring, ...) to (batch_size, n_offspring, ...)
             reward = unbatchify(reward, self.n_offspring)  # type: ignore
@@ -220,8 +226,12 @@ class GA:
 
             # NGO masking
             if parents_mask is not None:
-                batch_indices = torch.arange(parents_mask.size(0), device=parents_mask.device)
-                new_mask = mask * parents_mask[batch_indices, td["current_node"].squeeze(-1)]
+                batch_indices = torch.arange(
+                    parents_mask.size(0), device=parents_mask.device
+                )
+                new_mask = mask * parents_mask[
+                    batch_indices, td["current_node"].squeeze(-1)
+                ]
                 # Mutation here
                 invalid_indices = new_mask.sum(-1) == 0  # invalid case
                 mutation_indices = torch.rand(  # stochastic mutation
@@ -270,12 +280,16 @@ class GA:
         else:
             raise NotImplementedError(f"Local search not implemented for {env.name}")
 
-        best_actions = env.local_search(td=td, actions=actions, **self.local_search_params)
+        best_actions = env.local_search(
+            td=td, actions=actions, **self.local_search_params
+        )
         best_rewards = env.get_reward(td, best_actions)
 
         if self.use_nls:
             td_perturb = td.clone()
-            td_perturb["distances"] = torch.tile(self.heuristic_dist, (self.n_offspring, 1, 1))
+            td_perturb["distances"] = torch.tile(
+                self.heuristic_dist, (self.n_offspring, 1, 1)
+            )
             new_actions = best_actions.clone()
 
             for _ in range(self.n_perturbations):
@@ -288,7 +302,9 @@ class GA:
                 new_rewards = env.get_reward(td, new_actions)
 
                 improved_indices = new_rewards > best_rewards
-                best_actions = env.replace_selected_actions(best_actions, new_actions, improved_indices)
+                best_actions = env.replace_selected_actions(
+                    best_actions, new_actions, improved_indices
+                )
                 best_rewards[improved_indices] = new_rewards[improved_indices]
 
         best_actions = best_actions.to(device)
@@ -340,7 +356,9 @@ class GA:
         else:  # for other envs, we may need to pad the actions
             diff_length = actions.size(-1) - population["actions"].size(-1)
             if diff_length > 0:
-                population["actions"] = torch.nn.functional.pad(population["actions"], (0, diff_length), value=0)
+                population["actions"] = torch.nn.functional.pad(
+                    population["actions"], (0, diff_length), value=0
+                )
             elif diff_length < 0:
                 actions = torch.nn.functional.pad(actions, (0, -diff_length), value=0)
             concated_actions = torch.cat([population["actions"], actions], dim=1)
@@ -378,10 +396,15 @@ class GA:
             # rank-based selection
             score_ranks = torch.argsort(torch.argsort(-concated_reward, dim=1), dim=1)
             novelty_ranks = torch.argsort(torch.argsort(-concated_novelty, dim=1), dim=1)
-            weighted_ranks = (1 - self.novelty_rank_w) * score_ranks + self.novelty_rank_w * novelty_ranks
+            weighted_ranks = (
+                (1 - self.novelty_rank_w) * score_ranks
+                + self.novelty_rank_w * novelty_ranks
+            )
             weights = 1.0 / (self.rank_coefficient * new_n + weighted_ranks)
             weights *= uniqueness_weights
-            indices_to_keep = torch.multinomial(weights, self.n_population, replacement=False)
+            indices_to_keep = torch.multinomial(
+                weights, self.n_population, replacement=False
+            )
             batch_indices = self._batchindex.unsqueeze(1).expand(-1, self.n_population)
             population["actions"] = concated_actions[batch_indices, indices_to_keep]
             population["edge_mask"] = concated_edge_mask[batch_indices, indices_to_keep]
@@ -396,16 +419,26 @@ class GA:
 
         actions_flat = actions.reshape(batch_size * n, max_seq_len)
         # actions_flat.shape == (batch_size * n, max_seq_len)
-        edge_index = torch.stack([actions_flat, torch.roll(actions_flat, shifts=-1, dims=1)], dim=2)
+        edge_index = torch.stack(
+            [actions_flat, torch.roll(actions_flat, shifts=-1, dims=1)], dim=2
+        )
         row = edge_index[:, :, 0]
         col = edge_index[:, :, 1]
-        batch_indices = torch.arange(batch_size * n, device=actions.device).view(-1, 1).expand(-1, max_seq_len)
-        linear_indices_forward = batch_indices * (n_nodes * n_nodes) + row * n_nodes + col
-        linear_indices_backward = batch_indices * (n_nodes * n_nodes) + col * n_nodes + row
-        linear_indices = torch.cat([linear_indices_forward, linear_indices_backward], dim=1).reshape(-1)
+        batch_indices = (
+            torch.arange(batch_size * n, device=actions.device)
+            .view(-1, 1)
+            .expand(-1, max_seq_len)
+        )
+        flat_indices_forward = batch_indices * (n_nodes * n_nodes) + row * n_nodes + col
+        flat_indices_backward = batch_indices * (n_nodes * n_nodes) + col * n_nodes + row
+        flat_indices = torch.cat(
+            [flat_indices_forward, flat_indices_backward], dim=1
+        ).reshape(-1)
         total_elements = batch_size * n * n_nodes * n_nodes
-        edge_mask_flat = torch.zeros(total_elements, dtype=torch.bool, device=actions.device)
-        edge_mask_flat[linear_indices] = True
+        edge_mask_flat = torch.zeros(
+            total_elements, dtype=torch.bool, device=actions.device
+        )
+        edge_mask_flat[flat_indices] = True
         edge_mask = edge_mask_flat.view(batch_size, n, n_nodes, n_nodes)
         # edge_mask.shape == (batch_size, n, n_nodes, n_nodes)
 
@@ -414,7 +447,9 @@ class GA:
     def _pairwise_distance(self, edge_mask: Tensor) -> Tensor:
         batch_size, n, n_nodes, _ = edge_mask.size()
         if SAVE_MEMORY:  # For-loop Version (to avoid OOM)
-            pairwise_sum = torch.zeros((batch_size, n, n), dtype=torch.float, device=edge_mask.device)
+            pairwise_sum = torch.zeros(
+                (batch_size, n, n), dtype=torch.float, device=edge_mask.device
+            )
             for b in range(batch_size):
                 _edges = edge_mask[b].view(n, -1).to(torch.float)
                 pairwise_sum[b] = torch.mm(_edges, _edges.transpose(0, 1))
@@ -428,25 +463,35 @@ class GA:
         return pairwise_distance
 
     def _get_parents_mask(self, population: dict[str, Tensor]) -> Optional[Tensor]:
-        if len(population["reward"]) == 0 or population["reward"].size(1) < self.n_population:
+        reward = population["reward"]
+        novelty = population["novelty"]
+        if len(reward) == 0 or reward.size(1) < self.n_population:
             return None
 
         # rank-based selection
-        score_ranks = torch.argsort(torch.argsort(-population["reward"], dim=1), dim=1)
-        novelty_ranks = torch.argsort(torch.argsort(-population["novelty"], dim=1), dim=1)
-        weighted_ranks = (1 - self.novelty_rank_w) * score_ranks + self.novelty_rank_w * novelty_ranks
+        score_ranks = torch.argsort(torch.argsort(-reward, dim=1), dim=1)
+        novelty_ranks = torch.argsort(torch.argsort(-novelty, dim=1), dim=1)
+        weighted_ranks = (
+            (1 - self.novelty_rank_w) * score_ranks + self.novelty_rank_w * novelty_ranks
+        )
         weights = 1.0 / (self.rank_coefficient * self.n_population + weighted_ranks)
         # weights.shape == (batch_size, n_population)
 
         if SAVE_MEMORY:  # For-loop & Sparse Version (to avoid OOM)
             weights_expanded = cast(Tensor, batchify(weights, self.n_offspring))
-            parents_indices = torch.multinomial(weights_expanded, self.n_parents, replacement=False)
+            parents_indices = torch.multinomial(
+                weights_expanded, self.n_parents, replacement=False
+            )
             parents_indices_batched = unbatchify(parents_indices, self.n_offspring)
             # parents_indices.shape == (batch_size, n_offspring, n_parents)
 
             parents_edge_masks = torch.cat(
                 [
-                    population["edge_mask"][b, parents_indices_batched[b]].unsqueeze(1).to_sparse_coo()
+                    (
+                        population["edge_mask"][b, parents_indices_batched[b]]
+                        .unsqueeze(1)
+                        .to_sparse_coo()
+                    )
                     for b in range(self.batch_size)
                 ],
                 dim=1,
@@ -455,9 +500,13 @@ class GA:
 
         else:  # Batch & Dense Version
             weights_expanded = cast(Tensor, batchify(weights, self.n_offspring))
-            parents_indices = torch.multinomial(weights_expanded, self.n_parents, replacement=False)
+            parents_indices = torch.multinomial(
+                weights_expanded, self.n_parents, replacement=False
+            )
 
-            parents_edge_masks = cast(Tensor, batchify(population["edge_mask"], self.n_offspring))
+            parents_edge_masks = cast(
+                Tensor, batchify(population["edge_mask"], self.n_offspring)
+            )
             batch_indices = torch.arange(
                 parents_edge_masks.size(0), device=parents_edge_masks.device
             ).unsqueeze(1).expand(-1, self.n_parents)

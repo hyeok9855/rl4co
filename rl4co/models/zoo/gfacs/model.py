@@ -71,7 +71,9 @@ class GFACS(DeepACO):
     @property
     def alpha(self) -> float:
         return self.alpha_min + (self.alpha_max - self.alpha_min) * min(
-            self.current_epoch / self.trainer.max_epochs, 1.0  # type: ignore
+            self.current_epoch
+            / (self.trainer.max_epochs - self.alpha_flat_epochs),  # type: ignore
+            1.0,
         )
 
     @property

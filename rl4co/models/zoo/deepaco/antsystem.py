@@ -45,7 +45,7 @@ class AntSystem:
         pheromone: Optional[Tensor | int] = None,
         use_local_search: bool = False,
         use_nls: bool = False,
-        n_perturbations: int = 5,
+        n_perturbations: int = 1,
         local_search_params: dict = {},
         perturbation_params: dict = {},
     ):
@@ -54,7 +54,7 @@ class AntSystem:
         self.alpha = alpha
         self.beta = beta
         self.decay = decay
-        self.Q = 1 / self.n_ants if Q is None else Q
+        self.Q = 1 / self.n_ants / self.decay if Q is None else Q
 
         self.log_heuristic = log_heuristic
 
@@ -82,7 +82,9 @@ class AntSystem:
     def heuristic_dist(self) -> torch.Tensor:
         heuristic = self.log_heuristic.exp().detach().cpu() + 1e-10
         heuristic_dist = 1 / (heuristic / heuristic.max(-1, keepdim=True)[0] + 1e-5)
-        heuristic_dist[:, torch.arange(heuristic_dist.shape[1]), torch.arange(heuristic_dist.shape[2])] = 0
+        heuristic_dist[
+            :, torch.arange(heuristic_dist.shape[1]), torch.arange(heuristic_dist.shape[2])
+        ] = 0
         return heuristic_dist
 
     def run(
@@ -91,6 +93,7 @@ class AntSystem:
         env: RL4COEnvBase,
         n_iterations: int,
         decoding_kwargs: dict,
+        disable_tqdm: bool = False,
     ) -> Tuple[Tensor, dict[int, Tensor]]:
         """Run the Ant System algorithm for a specified number of iterations.
 
@@ -104,12 +107,15 @@ class AntSystem:
             actions: The final actions chosen by the algorithm.
             reward: The final reward achieved by the algorithm.
         """
-        for i in (pbar := trange(n_iterations, dynamic_ncols=True, desc="Running ACO")):
+        pbar = trange(
+            n_iterations, dynamic_ncols=True, desc="Running ACO", disable=disable_tqdm
+        )
+        for i in pbar:
             # reset environment
             td = td_initial.clone()
             self._one_step(td, env, decoding_kwargs)
             self.final_reward_cache[i] = self.final_reward.clone()  # type: ignore
-            pbar.set_postfix({"reward": self.final_reward.mean().item()})  # type: ignore
+            pbar.set_postfix({"reward": f"{self.final_reward.mean().item():.3f}"})  # type: ignore
 
         action_matrix = self._convert_final_action_to_matrix()
         return action_matrix, self.final_reward_cache
@@ -217,7 +223,9 @@ class AntSystem:
                 new_rewards = env.get_reward(td, new_actions)
 
                 improved_indices = new_rewards > best_rewards
-                best_actions = env.replace_selected_actions(best_actions, new_actions, improved_indices)
+                best_actions = env.replace_selected_actions(
+                    best_actions, new_actions, improved_indices
+                )
                 best_rewards[improved_indices] = new_rewards[improved_indices]
 
         best_actions = best_actions.to(device)
@@ -248,20 +256,20 @@ class AntSystem:
 
         # calculate Δphe
         delta_pheromone = torch.zeros_like(self.pheromone)
-        from_node = actions
-        to_node = torch.roll(from_node, -1, -1)
+        from_node = actions[:, :, :-1]
+        to_node = actions[:, :, 1:]
         mapped_reward = self._reward_map(reward).detach()
         batch_action_indices = self._batch_action_indices(
-            self.batch_size, actions.shape[-1], reward.device
+            self.batch_size, actions.shape[-1] - 1, reward.device
         )
 
-        # TODO: vectorize this
         for ant_index in range(self.n_ants):
             delta_pheromone[
                 batch_action_indices,
                 from_node[:, ant_index].flatten(),
                 to_node[:, ant_index].flatten(),
             ] += mapped_reward[batch_action_indices, ant_index]
+        delta_pheromone[:, 0, 0] = 0  # to ignore the tailing zeros
 
         # decay & update
         self.pheromone *= self.decay
