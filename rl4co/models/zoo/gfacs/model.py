@@ -25,6 +25,12 @@ class GFACS(DeepACO):
         train_with_local_search: Whether to train with local search. Defaults to False.
         policy_kwargs: Keyword arguments for policy
         baseline_kwargs: Keyword arguments for baseline
+        alpha_min: Minimum value for alpha. Defaults to 0.5.
+        alpha_max: Maximum value for alpha. Defaults to 1.0.
+        alpha_flat_epochs: Number of epochs to keep alpha constant. Defaults to 5.
+        beta_min: Minimum value for beta. Defaults to 1.0.
+        beta_max: Maximum value for beta. Defaults to 1.0.
+        beta_flat_epochs: Number of epochs to keep beta constant. Defaults to 5.
         **kwargs: Keyword arguments passed to the superclass
     """
 
@@ -108,7 +114,7 @@ class GFACS(DeepACO):
         if self.train_with_local_search:
             ls_reward = policy_out["ls_reward"]
             ls_advantage = ls_reward - ls_reward.mean(dim=1, keepdim=True)
-            weighted_advantage = (advantage * (1 - self.alpha) + ls_advantage * self.alpha)
+            weighted_advantage = advantage * (1 - self.alpha) + ls_advantage * self.alpha
         else:
             weighted_advantage = advantage
 

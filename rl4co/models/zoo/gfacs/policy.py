@@ -114,12 +114,11 @@ class GFACSPolicy(DeepACOPolicy):
             logprobs, actions, td, env = self.common_decoding(
                 self.decode_type, td_initial, env, heatmap, actions, **decoding_kwargs
             )
-            td.set("reward", env.get_reward(td, actions))
 
             # Output dictionary construction
             outdict = {
                 "logZ": logZ,
-                "reward": unbatchify(td["reward"], n_ants),
+                "reward": unbatchify(env.get_reward(td, actions), n_ants),
                 "log_likelihood": unbatchify(
                     get_log_likelihood(logprobs, actions, td.get("mask", None), True), n_ants
                 )
@@ -134,14 +133,13 @@ class GFACSPolicy(DeepACOPolicy):
                 # TODO: Refactor this so that we don't need to use the aco object
                 aco = self.aco_class(heatmap, n_ants=n_ants, **self.aco_kwargs)
                 ls_actions, ls_reward = aco.local_search(
-                    batchify(td_initial, n_ants), env, actions, decoding_kwargs  # type:ignore
+                    batchify(td_initial, n_ants), env, actions, decoding_kwargs
                 )
                 ls_decoding_kwargs = decoding_kwargs.copy()
                 ls_decoding_kwargs["top_k"] = 0  # This should be 0, otherwise logprobs can be -inf
                 ls_logprobs, ls_actions, td, env = self.common_decoding(
                     "evaluate", td_initial, env, heatmap, ls_actions, **ls_decoding_kwargs
                 )
-                td.set("ls_reward", ls_reward)
                 outdict.update(
                     {
                         "ls_logZ": ls_logZ,

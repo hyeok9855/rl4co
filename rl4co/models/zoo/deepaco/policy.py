@@ -146,11 +146,11 @@ class DeepACOPolicy(NonAutoregressivePolicy):
             outdict["reward"] = unbatchify(outdict["reward"], n_ants)
 
             if self.train_with_local_search:
-                heatmap_logits = outdict["hidden"]
+                heatmap = outdict["hidden"]
                 # TODO: Refactor this so that we don't need to use the aco object
-                aco = self.aco_class(heatmap_logits, n_ants=n_ants, **self.aco_kwargs)
+                aco = self.aco_class(heatmap, n_ants=n_ants, **self.aco_kwargs)
                 _, ls_reward = aco.local_search(
-                    batchify(td_initial, n_ants), env, outdict["actions"]  # type:ignore
+                    batchify(td_initial, n_ants), env, outdict["actions"], decoding_kwargs
                 )
                 outdict["ls_reward"] = unbatchify(ls_reward, n_ants)
 

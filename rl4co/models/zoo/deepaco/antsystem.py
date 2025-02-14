@@ -41,7 +41,6 @@ class AntSystem:
         beta: float = 1.0,
         decay: float = 0.95,
         Q: Optional[float] = None,
-        update_pheromone: bool = True,
         pheromone: Optional[Tensor | int] = None,
         use_local_search: bool = False,
         use_nls: bool = False,
@@ -58,7 +57,6 @@ class AntSystem:
 
         self.log_heuristic = log_heuristic
 
-        self.update_pheromone = update_pheromone
         if pheromone is None or isinstance(pheromone, int):
             self.pheromone = torch.ones_like(log_heuristic)
             self.pheromone.fill_(pheromone if isinstance(pheromone, int) else 1)
@@ -93,7 +91,7 @@ class AntSystem:
         env: RL4COEnvBase,
         n_iterations: int,
         decoding_kwargs: dict,
-        disable_tqdm: bool = False,
+        disable_tqdm: bool = True,
     ) -> Tuple[Tensor, dict[int, Tensor]]:
         """Run the Ant System algorithm for a specified number of iterations.
 
@@ -101,6 +99,8 @@ class AntSystem:
             td_initial: Initial state of the problem.
             env: Environment representing the problem.
             n_iterations: Number of iterations to run the algorithm.
+            decoding_kwargs: Keyword arguments for decoding strategy.
+            disable_tqdm: Whether to disable the tqdm progress bar. Defaults to False.
 
         Returns:
             td: The final state of the problem.
@@ -126,6 +126,7 @@ class AntSystem:
         Args:
             td: Current state of the problem.
             env: Environment representing the problem.
+            decoding_kwargs: Keyword arguments for decoding strategy.
 
         Returns:
             actions: The actions chosen by the algorithm.
@@ -251,9 +252,6 @@ class AntSystem:
         return best_index
 
     def _update_pheromone(self, actions, reward):
-        if not self.update_pheromone:
-            return
-
         # calculate Δphe
         delta_pheromone = torch.zeros_like(self.pheromone)
         from_node = actions[:, :, :-1]
