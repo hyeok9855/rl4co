@@ -157,12 +157,11 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
             logprobs, actions, td, env = self.common_decoding(
                 self.decode_type, td_initial, env, heatmap, actions, **decoding_kwargs
             )
-            td.set("reward", env.get_reward(td, actions))
 
             # Output dictionary construction
             outdict = {
                 "logZ": logZ,
-                "reward": unbatchify(td["reward"], n_offspring),
+                "reward": unbatchify(env.get_reward(td, actions), n_offspring),
                 "log_likelihood": unbatchify(
                     get_log_likelihood(logprobs, actions, td.get("mask", None), True), n_offspring
                 )
@@ -186,7 +185,6 @@ class NGONonAutoregressivePolicy(NonAutoregressivePolicy):
                 ls_logprobs, ls_actions, td, env = self.common_decoding(
                     "evaluate", td_initial, env, heatmap, ls_actions, **ls_decoding_kwargs
                 )
-                td.set("ls_reward", ls_reward)
                 outdict.update(
                     {
                         "ls_logZ": ls_logZ,
