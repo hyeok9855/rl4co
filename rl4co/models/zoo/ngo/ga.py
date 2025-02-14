@@ -15,7 +15,7 @@ from rl4co.utils.decoding import Sampling
 from rl4co.utils.ops import batchify, get_distance_matrix, unbatchify
 
 
-SAVE_MEMORY = True
+SAVE_MEMORY = False
 
 
 class GA:
@@ -44,7 +44,7 @@ class GA:
         n_offspring: int = 100,
         n_parents: int = 2,
         mutation_rate: float = 0.01,
-        rank_coefficient: float = 0.01,
+        rank_coefficient: float = 0.001,
         novelty_rank_w: float = 0.0,
         use_local_search: bool = False,
         use_nls: bool = False,
