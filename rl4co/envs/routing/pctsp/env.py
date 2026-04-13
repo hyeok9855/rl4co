@@ -101,7 +101,7 @@ class PCTSPEnv(RL4COEnvBase):
     ) -> TensorDict:
         device = td.device
 
-        locs = torch.cat([td["depot"][..., None, :], td["locs"]], dim=-2)
+        locs = td["locs"]
         expected_prize = td["deterministic_prize"]
         real_prize = (
             td["stochastic_prize"] if self.stochastic else td["deterministic_prize"]
@@ -112,7 +112,6 @@ class PCTSPEnv(RL4COEnvBase):
         real_prize_with_depot = torch.cat(
             [torch.zeros_like(real_prize[..., :1]), real_prize], dim=-1
         )
-        penalty_with_depot = F.pad(penalty, (1, 0), mode="constant", value=0)
 
         # Initialize the current node and  prize / penalty
         current_node = torch.zeros((*batch_size,), dtype=torch.int64, device=device)
@@ -134,7 +133,7 @@ class PCTSPEnv(RL4COEnvBase):
                 "current_node": current_node,
                 "expected_prize": expected_prize,
                 "real_prize": real_prize_with_depot,
-                "penalty": penalty_with_depot,
+                "penalty": penalty,
                 "cur_total_prize": cur_total_prize,
                 "cur_total_penalty": cur_total_penalty,
                 "visited": visited,
@@ -273,6 +272,10 @@ class PCTSPEnv(RL4COEnvBase):
         )
         self.reward_spec = Unbounded(shape=(1,))
         self.done_spec = Unbounded(shape=(1,), dtype=torch.bool)
+
+    def local_search(self, td: TensorDict, actions: torch.Tensor, **kwargs) -> torch.Tensor:
+        from .local_search import local_search  # Lazy import to avoid circular imports
+        return local_search(self, td, actions, **kwargs)
 
     @staticmethod
     def render(td: TensorDict, actions: torch.Tensor = None, ax=None):

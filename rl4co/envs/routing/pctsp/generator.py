@@ -1,6 +1,7 @@
 from typing import Callable
 
 from tensordict.tensordict import TensorDict
+import torch
 from torch.distributions import Uniform
 
 from rl4co.envs.common.utils import Generator, get_sampler
@@ -9,7 +10,7 @@ from rl4co.utils.pylogger import get_pylogger
 log = get_pylogger(__name__)
 
 
-MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0}
+MAX_LENGTHS = {20: 2.0, 50: 3.0, 100: 4.0, 200: 5.0, 500: 7.0, 1000: 10.0}
 
 
 class PCTSPGenerator(Generator):
@@ -108,14 +109,15 @@ class PCTSPGenerator(Generator):
         if self.depot_sampler is not None:
             depot = self.depot_sampler.sample((*batch_size, 2))
             locs = self.loc_sampler.sample((*batch_size, self.num_loc, 2))
+            locs = torch.cat([depot[..., None, :], locs], dim=-2)
         else:
             # if depot_sampler is None, sample the depot from the locations
             locs = self.loc_sampler.sample((*batch_size, self.num_loc + 1, 2))
             depot = locs[..., 0, :]
-            locs = locs[..., 1:, :]
 
         # Sample penalty
         penalty = self.penalty_sampler.sample((*batch_size, self.num_loc))
+        penalty = torch.cat([torch.zeros_like(penalty[..., :1]), penalty], dim=-1)
 
         # Take uniform prizes
         # Now expectation is 0.5 so expected total prize is n / 2, we want to force to visit approximately half of the nodes

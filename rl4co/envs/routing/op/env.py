@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from tensordict.tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded
@@ -110,21 +109,17 @@ class OPEnv(RL4COEnvBase):
         device = td.device
 
         # Add depot to locs
-        locs_with_depot = torch.cat((td["depot"][:, None, :], td["locs"]), -2)
+        locs_with_depot = td["locs"]
 
         # Create reset TensorDict
         td_reset = TensorDict(
             {
                 "locs": locs_with_depot,
-                "prize": F.pad(
-                    td["prize"], (1, 0), mode="constant", value=0
-                ),  # add 0 for depot
+                "prize": td["prize"],  # 0 for depot
                 "tour_length": torch.zeros(*batch_size, device=device),
                 # max_length is max length allowed when arriving at node, so subtract distance to return to depot
                 # Additionally, substract epsilon margin for numeric stability
-                "max_length": td["max_length"][..., None]
-                - (td["depot"][..., None, :] - locs_with_depot).norm(p=2, dim=-1)
-                - 1e-6,
+                "max_length": td["max_length"],
                 "current_node": torch.zeros(
                     *batch_size, 1, dtype=torch.long, device=device
                 ),
@@ -152,16 +147,14 @@ class OPEnv(RL4COEnvBase):
         """
         current_loc = gather_by_index(td["locs"], td["current_node"])[..., None, :]
         exceeds_length = (
-            td["tour_length"][..., None] + (td["locs"] - current_loc).norm(p=2, dim=-1)
+            td["tour_length"][..., None] + (td["locs"] - current_loc).norm(p=2, dim=-1) + 1e-5
             > td["max_length"]
         )
         mask = td["visited"] | td["visited"][..., 0:1] | exceeds_length
-
-        action_mask = ~mask  # 1 = feasible action, 0 = infeasible action
-
-        # Depot can always be visited: we do not hardcode knowledge that this is strictly suboptimal if other options are available
-        action_mask[..., 0] = 1
-        return action_mask
+        # do not mask the depot, except if we're at the depot at the first step
+        mask[:, 0] = 0
+        mask[:, 0] = (td["i"] == 0) & (td["current_node"].squeeze(-1) == 0)
+        return ~mask  # 1 = feasible action, 0 = infeasible action
 
     def _get_reward(self, td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """Reward is the sum of the prizes of visited nodes"""
@@ -197,10 +190,8 @@ class OPEnv(RL4COEnvBase):
 
         max_length = td["max_length"]
         if add_distance_to_depot:
-            max_length = (
-                max_length
-                + (td["locs"][..., 0:1, :] - td["locs"]).norm(p=2, dim=-1)
-                + 1e-6
+            max_length = max_length + (td["locs"][..., 0:1, :] - td["locs"]).norm(
+                p=2, dim=-1
             )
         assert (
             length[..., None] <= max_length + 1e-5
@@ -252,6 +243,10 @@ class OPEnv(RL4COEnvBase):
         self.reward_spec = Unbounded(shape=(1,))
         self.done_spec = Unbounded(shape=(1,), dtype=torch.bool)
 
+    def local_search(self, td: TensorDict, actions: torch.Tensor, **kwargs) -> torch.Tensor:
+        from rl4co.envs.routing.pctsp.local_search import local_search  # Same operation for both PCTSP and OP
+        return local_search(self, td, actions, **kwargs)
+    
     @staticmethod
     def render(td: TensorDict, actions: torch.Tensor = None, ax=None):
         return render(td, actions, ax)
